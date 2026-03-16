@@ -82,11 +82,20 @@ IGNORE_DIRS = {
 class AIClassifier:
     def __init__(self, api_key: str):
         if not api_key:
+            print("  ⚠  AI Intelligence: INACTIVE (No API Key provided)")
             self.model = None
             return
         try:
             genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-flash')
+            # Find the best available flash or pro model
+            models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            model_name = "gemini-1.5-flash" # Default
+            for m in models:
+                if "flash" in m:
+                    model_name = m
+                    break
+            self.model = genai.GenerativeModel(model_name)
+            print(f"  ✓  AI Intelligence: INITIALIZED using '{model_name}'")
         except Exception as e:
             print(f"  ⚠  Failed to initialize Gemini: {e}")
             self.model = None
@@ -133,9 +142,11 @@ class AIClassifier:
 
         try:
             response = self.model.generate_content(prompt)
+            print(f"    [AI DEBUG] Raw Response: '{response.text.strip()}'")
             topic = response.text.strip().split('\n')[0].strip().replace('.', '').title()
             return topic if len(topic) < 20 else "General"
-        except Exception:
+        except Exception as e:
+            print(f"    [AI DEBUG] Error: {e}")
             return "General"
 
 # ─────────────────────────────────────────────
