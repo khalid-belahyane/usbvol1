@@ -26,10 +26,23 @@ import hashlib
 import shutil
 import argparse
 import time
+import threading
+import queue
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
 import concurrent.futures
+
+# Butler/AI imports
+try:
+    import watchdog.observers
+    import watchdog.events
+    import google.generativeai as genai
+    import fitz  # PyMuPDF
+    from docx import Document as DocxDocument
+except ImportError as e:
+    # We allow imports to fail so the basic tool still works without extra libs
+    pass
 
 # ─────────────────────────────────────────────
 #  CONFIGURATION
@@ -56,8 +69,158 @@ IGNORE_DIRS = {
     ".svn", 
     "Windows", 
     "Program Files",
-    "Program Files (x86)"
+    "Program Files (x86)",
+    "node_modules",
+    "__pycache__",
+    ".gemini"
 }
+
+# ─────────────────────────────────────────────
+#  AI INTELLIGENCE LAYER
+# ─────────────────────────────────────────────
+
+class AIClassifier:
+    def __init__(self, api_key: str):
+        if not api_key:
+            self.model = None
+            return
+        try:
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-1.5-flash')
+        except Exception as e:
+            print(f"  ⚠  Failed to initialize Gemini: {e}")
+            self.model = None
+
+    def extract_text(self, path: Path, max_chars: int = 2000) -> str:
+        """Extract text from various file formats for AI analysis."""
+        ext = path.suffix.lower()
+        text = ""
+        try:
+            if ext in [".txt", ".md", ".json", ".yaml", ".py", ".js", ".ts", ".html", ".css"]:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read(max_chars)
+            elif ext == ".pdf":
+                doc = fitz.open(path)
+                for page in doc:
+                    text += page.get_text()
+                    if len(text) >= max_chars: break
+                doc.close()
+            elif ext == ".docx":
+                doc = DocxDocument(path)
+                text = "\n".join([p.text for p in doc.paragraphs])[:max_chars]
+        except Exception as e:
+            # Silently fail, we'll just fall back to generic categorization
+            pass
+        return text.strip()
+
+    def get_topic(self, path: Path) -> str:
+        """Consult AI to determine the topic of the file content."""
+        if not self.model:
+            return "General"
+
+        content = self.extract_text(path)
+        if not content:
+            # Try to guess from filename if content is missing
+            content = f"Filename: {path.name}"
+
+        prompt = (
+            f"Given the following content from a file named '{path.name}', "
+            "identify the single most relevant 'Topic' (one word, e.g., Finance, AI, Travel, Health, Work). "
+            "If it is a code file, identify the project type (e.g., WebApp, Script, Game).\n\n"
+            f"Content snippet:\n{content[:1500]}\n\n"
+            "Return ONLY the category word."
+        )
+
+        try:
+            response = self.model.generate_content(prompt)
+            topic = response.text.strip().split('\n')[0].strip().replace('.', '').title()
+            return topic if len(topic) < 20 else "General"
+        except Exception:
+            return "General"
+
+# ─────────────────────────────────────────────
+#  SMART BUTLER (REAL-TIME MONITOR)
+# ─────────────────────────────────────────────
+
+class ButlerHandler(watchdog.events.FileSystemEventHandler):
+    def __init__(self, root: Path, classifier: AIClassifier, grace_period: int = 10):
+        self.root = root
+        self.classifier = classifier
+        self.grace_period = grace_period
+        self.queue = queue.Queue()
+        self.pending_files = {} # path -> last_time
+        
+        # Start the processing thread
+        self.process_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.process_thread.start()
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._track_file(Path(event.src_path))
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._track_file(Path(event.dest_path))
+
+    def _track_file(self, path: Path):
+        # Ignore files already in category folders and system files
+        if any(ignored in path.parts for ignored in IGNORE_DIRS):
+            return
+        
+        # Don't track temp/download partial files
+        if path.suffix.lower() in [".crdownload", ".tmp", ".part"]:
+            return
+
+        self.pending_files[path] = time.time()
+
+    def _worker_loop(self):
+        while True:
+            time.sleep(2)
+            now = time.time()
+            to_process = []
+            
+            for path, last_seen in list(self.pending_files.items()):
+                if now - last_seen >= self.grace_period:
+                    to_process.append(path)
+                    del self.pending_files[path]
+
+            for path in to_process:
+                if path.exists():
+                    self._process_file(path)
+
+    def _process_file(self, path: Path):
+        print(f"\n🎩  Butler checking fresh arrival: {path.name}")
+        
+        # 1. Basic category
+        cat = get_category(path.suffix)
+        
+        # 2. AI Intelligence (Topic)
+        topic = "General"
+        if cat in ["Documents", "Text", "Code"]:
+            topic = self.classifier.get_topic(path)
+            print(f"    └─ AI Analysis: {topic}")
+        
+        # 3. Determine Destination
+        # Logic: Category / Topic / Year (if media)
+        if cat in ["Images", "Videos", "Audio"]:
+            mtime = path.stat().st_mtime
+            date = datetime.fromtimestamp(mtime)
+            subfolder = self.root / cat / str(date.year) / date.strftime("%m_%B")
+        else:
+            subfolder = self.root / cat / topic
+
+        dest = subfolder / path.name
+        if path.parent == subfolder:
+            return
+
+        subfolder.mkdir(parents=True, exist_ok=True)
+        final_dest = get_unique_path(dest)
+        
+        try:
+            shutil.move(str(path), str(final_dest))
+            print(f"    ✓ Automatically placed in {final_dest.relative_to(self.root)}")
+        except Exception as e:
+            print(f"    ⚠  Failed to move: {e}")
 
 # ─────────────────────────────────────────────
 #  HELPERS
@@ -365,6 +528,36 @@ def save_report(root: Path, deleted: list[Path], move_log: dict, dupes: dict, dr
         print(f"\n  ⚠  Could not save report: {e}")
 
 # ─────────────────────────────────────────────
+#  BUTLER STARTUP
+# ─────────────────────────────────────────────
+
+def start_butler(root: Path, classifier: AIClassifier, watch_dirs: list[Path]):
+    """Initialize and start the background watchdog observer."""
+    print("\n" + "═" * 60)
+    print("  🎩  SMART BUTLER IS NOW ON DUTY")
+    print("═" * 60)
+    print(f"  Watching: {[str(d) for d in watch_dirs]}")
+    print("  AI:       ACTIVE" if classifier.model else "  AI:       INACTIVE (No API Key)")
+    print("  Action:   Files will be organized after a 10s stability check.")
+    print("  Status:   Listening for new arrivals … (Press Ctrl+C to stop)")
+    print("-" * 60)
+
+    event_handler = ButlerHandler(root, classifier)
+    observer = watchdog.observers.Observer()
+    for d in watch_dirs:
+        if d.exists() and d.is_dir():
+            observer.schedule(event_handler, str(d), recursive=False)
+    
+    observer.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n\n👋  Butler is signing off. Drive remains clean!")
+        observer.stop()
+    observer.join()
+
+# ─────────────────────────────────────────────
 #  ENTRY POINT
 # ─────────────────────────────────────────────
 
@@ -374,11 +567,24 @@ def main():
     parser.add_argument("--auto-delete", action="store_true", help="Automatically delete duplicates without prompting")
     parser.add_argument("--auto-organize", action="store_true", help="Automatically move files without prompting")
     parser.add_argument("--dry-run", action="store_true", help="Show what would happen without actually modifying files")
+    parser.add_argument("--butler", action="store_true", help="Run in real-time 'Butler Mode' (watches for new files)")
+    parser.add_argument("--watch-dirs", nargs="+", help="Specific folders for the Butler to watch (defaults to root)")
+    parser.add_argument("--api-key", help="Gemini API Key for AI topic intelligence")
     
     args = parser.parse_args()
 
     # 1. Choose Path
     root = pick_drive(args.path)
+    
+    # 2. Setup AI
+    api_key = args.api_key or os.environ.get("GEMINI_API_KEY")
+    classifier = AIClassifier(api_key)
+
+    # 3. Handle Butler Mode
+    if args.butler:
+        watch_dirs = [Path(d) for d in args.watch_dirs] if args.watch_dirs else [root]
+        start_butler(root, classifier, watch_dirs)
+        return
 
     start_time = time.time()
 
